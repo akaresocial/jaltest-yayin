@@ -1,0 +1,413 @@
+# @origin thinktool@df8aeed ops/github/yayin.yml
+# jaltesttr.com — otomatik derleme, imzalama ve yayın.
+# Bu dosya herkese açık yayın deposunda .github/workflows/yayin.yml olarak durur; kaynağı özel depoda
+# ops/github/yayin.yml'dir (değiştirince iki yere de koyun). Açık depoda seed dalı YOKTUR; tetik kaynağı açık depoya
+# kopyalanmaz; depo adları, tetik adresi ve kullanıcı adı bu dosyada yazılmaz (PLAN §15 G12, §19).
+#
+# Her 5 dakikada bir (GitHub zamanlaması gecikebilir): özel kaynak deposunda yeni commit var mı, ya da yönetim panelinde
+# içerik değişti mi (api/version.php)? Değiştiyse: içeriği ve panel yönlendirmelerini canlı siteden al (api/export.php +
+# api/redirects.php; alınamazsa son yayınlananlar) → içerik HTML'i izin listesinden geçiyor mu (değişiklik gerekirse
+# DÜŞER) → derle → paketle → CI anahtarıyla imzala → main'e gönder → sunucudaki anlık tetiği çağır.
+# Kod (api/ yonetim/ _app/) CI'da İMZALANAMAZ: geliştiricinin çevrimdışı anahtarıyla imzalanmış ops/code-manifest.*
+# kaynak depoda olmalı; paket onunla uyuşmazsa derleme düşer, sunucu da kurmaz (G1).
+# İŞLER AYRIDIR (güvenlik denetimi yayin-03 — aynı job'un adımları aynı makineyi, dosya sistemini, $GITHUB_ENV'i paylaşır):
+#   denetle  → deploy key YALNIZCA burada; değişiklik var mı + kaynak kodu "git archive" ile kaynak.tar artifact'ı
+#   derle    → sırsız (contents: read): npm ci + next build + package.mjs → dist artifact'ı (bağımlılık kodu yalnız burada)
+#   imzala   → temiz makine, npm/bağımlılık YOK: kaynak.tar'dan yalnız scripts/sign-release.mjs (karması aşağıda sabit),
+#              site.config.json ve geliştiricinin kod imzası; dist'i CI anahtarıyla imzalar → yalnız manifest artifact'ı
+#   yayinla  → temiz makine, yazma jetonu yalnız burada: dist + imza → yayın deposu main
+#   tetik    → sunucudaki anlık tetiği çağırır (sırrı yalnız TETIK_URL)
+# Derleme ele geçse bile CI imza anahtarına ve yazma jetonuna ulaşamaz; imzalanacak statik içeriği değiştirebilir ama
+# sunucu .htaccess izin listesi ve geliştirici kod imzası yüzünden PHP çalıştıramaz.
+# Ayın 1'inde boş "nabız" commit'i: açık depoda 60 gün etkinlik olmazsa zamanlanmış iş akışları kapanır (Q7). Sunucu bu
+# commit'i "aynı yayın" olarak tanır ve kurulum yapmaz.
+#
+# Ayarlar (yayın deposu → Settings → Secrets and variables → Actions):
+#   secrets.SOURCE_DEPLOY_KEY  özel kaynak deposunun SALT-OKUR deploy key'i (SSH özel anahtarı; yalnızca "denetle" işinde,
+#                              diske yazılıp kullanıldıktan hemen sonra silinir; o işte üçüncü taraf kodu çalışmaz)
+#   secrets.SOURCE_REPO        özel kaynak deposu "sahip/ad"
+#   secrets.JT_CI_SIGNING_KEY  CI imza anahtarı (node scripts/sign-release.mjs keygen ci → release-ci.key İÇERİĞİ) —
+#                              yalnızca "imzala" işinde
+#   secrets.TETIK_URL          anlık tetik adresi (https://…/) — sır olarak: günlüklerde maskelenir
+#   vars.SITE_URL, vars.API_BASE  (isteğe bağlı; varsayılan https://jaltesttr.com)
+# Eylemler tam commit SHA'sına sabitlenmiştir (etiket taşınsa da değişmez). Güncellemek için:
+#   git ls-remote https://github.com/actions/checkout refs/tags/v7.0.1
+name: Yayın
+
+on:
+  # İLK YAYINA KADAR zamanlama KAPALI (siteye henüz kurulmadı; her 5 dk hatalı koşmasın).
+  # İlk başarılı kurulumdan sonra ops/github/yayin.yml'in tam hâli (schedule dahil) buraya konur.
+  workflow_dispatch:
+    inputs:
+      force:
+        description: 'Değişiklik olmasa da yeniden derle'
+        type: boolean
+        default: false
+      snapshot:
+        description: 'İçeriği canlı siteden değil kaynak depodaki ilk içerikten (content/seed/snapshot.json) al — yalnızca ilk kurulum'
+        type: boolean
+        default: false
+      reset_history:
+        description: "Yayın deposunun geçmişini tek commit'e indir (Q16; sunucu aynı yayını yeniden kurmaz)"
+        type: boolean
+        default: false
+
+concurrency:
+  group: yayin
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  SITE_URL: ${{ vars.SITE_URL || 'https://jaltesttr.com' }}
+  API_BASE: ${{ vars.API_BASE || vars.SITE_URL || 'https://jaltesttr.com' }}
+
+jobs:
+  nabiz:
+    if: github.event.schedule == '23 4 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    steps:
+      - name: Yayın deposu
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          fetch-depth: 1
+      - name: Aylık nabız commit'i
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git commit -q --allow-empty -m "Nabız $(date -u +%Y-%m) (zamanlanmış iş akışı açık kalsın)"
+          git push -q origin HEAD:main
+
+  denetle:
+    if: github.event.schedule != '23 4 1 * *'
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: read
+    outputs:
+      build: ${{ steps.check.outputs.build }}
+      source: ${{ steps.check.outputs.source }}
+    steps:
+      - name: Yayın deposu (salt okunur)
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: yayin
+          fetch-depth: 1
+          persist-credentials: false
+
+      # Deploy key YALNIZCA bu adımda vardır: diske 0600 yazılır, ls-remote + kaynak çekme, adım sonunda silinir (G22).
+      # Bu işte üçüncü taraf (bağımlılık) kodu çalışmaz; kaynak, sonraki işlere .git'siz kaynak.tar olarak geçer.
+      - name: Değişiklik var mı? Kaynak kodu al
+        id: check
+        env:
+          SOURCE_KEY: ${{ secrets.SOURCE_DEPLOY_KEY }}
+          SOURCE_REPO: ${{ secrets.SOURCE_REPO }}
+          FORCE: ${{ inputs.force || 'false' }}
+          SNAPSHOT: ${{ inputs.snapshot || 'false' }}
+          RESET: ${{ inputs.reset_history || 'false' }}
+        run: |
+          set -euo pipefail
+          umask 077
+          KEY="$RUNNER_TEMP/kaynak_anahtar"
+          trap 'rm -f "$KEY"' EXIT
+          printf '%s\n' "$SOURCE_KEY" > "$KEY"
+          mkdir -p ~/.ssh
+          # GitHub'ın yayımlanmış ed25519 sunucu anahtarı (ilk bağlantıda körü körüne güvenme)
+          echo 'github.com ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl' > ~/.ssh/known_hosts
+          export GIT_SSH_COMMAND="ssh -i $KEY -o IdentitiesOnly=yes -o StrictHostKeyChecking=yes"
+          src=$(git ls-remote "git@github.com:$SOURCE_REPO.git" refs/heads/main | cut -f1)
+          [ ${#src} -eq 40 ] || { echo "::error::Kaynak deposu okunamadı"; exit 1; }
+          ver=$(curl -fsS --connect-timeout 10 --max-time 20 --retry 2 --retry-all-errors "$API_BASE/api/version.php" 2>/dev/null | jq -r '.version // empty' 2>/dev/null || true)
+          prev_src=$(jq -r '.source // empty' yayin/public/version.json 2>/dev/null || true)
+          prev_ver=$(jq -r '.contentVersion // empty' yayin/public/version.json 2>/dev/null || true)
+          echo "kaynak: ${src:0:7} (yayında ${prev_src:0:7}) · içerik: ${ver:-okunamadı} (yayında ${prev_ver:-yok})"
+          build=false
+          if [ "$FORCE" = "true" ] || [ "$SNAPSHOT" = "true" ] || [ "$RESET" = "true" ] || [ "$src" != "$prev_src" ]; then build=true; fi
+          if [ -n "$ver" ] && [ "$ver" != "$prev_ver" ]; then build=true; fi
+          if [ "$build" = "true" ]; then
+            git init -q src
+            git -C src fetch -q --depth 1 "git@github.com:$SOURCE_REPO.git" "$src"
+            git -C src archive --format=tar -o "$RUNNER_TEMP/kaynak.tar" FETCH_HEAD
+            # yayınlanan son içerik ve panel yönlendirmeleri: canlıdan alınamazsa derleme bunlarla yapılır
+            if [ -f yayin/_ops/content.json ]; then cp yayin/_ops/content.json "$RUNNER_TEMP/son-icerik.json"; fi
+            if [ -f yayin/_ops/redirects.json ]; then cp yayin/_ops/redirects.json "$RUNNER_TEMP/son-yonlendirmeler.json"; fi
+          fi
+          rm -f "$KEY"
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "source=$src" >> "$GITHUB_OUTPUT"
+
+      - name: Kaynak (sonraki işler için)
+        if: steps.check.outputs.build == 'true'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: kaynak
+          path: |
+            ${{ runner.temp }}/kaynak.tar
+            ${{ runner.temp }}/son-icerik.json
+            ${{ runner.temp }}/son-yonlendirmeler.json
+          if-no-files-found: error
+          retention-days: 1
+
+  # Bağımlılık kodu YALNIZCA bu işte çalışır. Hiçbir sır yok; jeton salt okunur. Çıktı: dist artifact'ı.
+  derle:
+    needs: denetle
+    if: needs.denetle.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+    permissions:
+      contents: read
+    steps:
+      - name: Kaynak
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kaynak
+          path: ${{ runner.temp }}/kaynak
+
+      - name: Aç
+        run: |
+          set -euo pipefail
+          mkdir src && tar -xf "$RUNNER_TEMP/kaynak/kaynak.tar" -C src
+
+      - name: Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+          cache: npm
+          cache-dependency-path: src/package-lock.json
+
+      - name: İçerik (yönetim panelinden)
+        working-directory: src
+        env:
+          SNAPSHOT: ${{ inputs.snapshot || 'false' }}
+        run: |
+          set -euo pipefail
+          valid() { jq -e '.version == 2 and (.products | length) > 0 and (.settings | type) == "object"' "$1" > /dev/null 2>&1; }
+          if [ "$SNAPSHOT" = "true" ]; then
+            valid content/seed/snapshot.json || { echo "::error::content/seed/snapshot.json geçersiz"; exit 1; }
+            cp content/seed/snapshot.json content/current.json
+            echo "İlk kurulum: content/seed/snapshot.json kullanılıyor"
+          elif curl -fsS --connect-timeout 10 --max-time 60 --retry 4 --retry-delay 10 --retry-all-errors "$API_BASE/api/export.php" -o content/current.json && valid content/current.json; then
+            echo "İçerik sürümü: $(jq -r .contentVersion content/current.json) · ürün: $(jq '.products | length' content/current.json)"
+          elif valid "$RUNNER_TEMP/kaynak/son-icerik.json"; then
+            # Sunucunun güvenlik duvarı bu GitHub makinesini engelledi: son yayınlanan içerikle derle
+            echo "::warning::Canlı içerik alınamadı; son yayınlanan içerik (v$(jq -r .contentVersion "$RUNNER_TEMP/kaynak/son-icerik.json")) kullanılıyor"
+            cp "$RUNNER_TEMP/kaynak/son-icerik.json" content/current.json
+          else
+            echo "::error::İçerik alınamadı ve yedek yok"; exit 1
+          fi
+          # Panel yönlendirmeleri (redirects tablosu — güvenlik denetimi enjeksiyon-05). package.mjs doğrular (döngü,
+          # çakışma, yalnız göreli yol, 301/302/410) ve .htaccess'e eski adres bloğundan ÖNCE yazar.
+          rvalid() { jq -e '(.redirects | type) == "array"' "$1" > /dev/null 2>&1; }
+          if curl -fsS --connect-timeout 10 --max-time 30 --retry 3 --retry-delay 10 --retry-all-errors "$API_BASE/api/redirects.php" -o content/panel-redirects.json && rvalid content/panel-redirects.json; then
+            echo "Panel yönlendirmeleri: $(jq '.redirects | length' content/panel-redirects.json) (atlanan: $(jq '.skipped // 0' content/panel-redirects.json))"
+          elif rvalid "$RUNNER_TEMP/kaynak/son-yonlendirmeler.json"; then
+            echo "::warning::Panel yönlendirmeleri alınamadı; son yayınlanan liste ($(jq '.redirects | length' "$RUNNER_TEMP/kaynak/son-yonlendirmeler.json") satır) kullanılıyor"
+            cp "$RUNNER_TEMP/kaynak/son-yonlendirmeler.json" content/panel-redirects.json
+          else
+            echo "::warning::Panel yönlendirmeleri alınamadı ve önceki liste yok; yalnız eski adres haritası yazılacak"
+            echo '{"ok":true,"redirects":[]}' > content/panel-redirects.json
+          fi
+
+      # İçerik HTML'i (bodyHtml/contentHtml) sunucunun izin listesinden (backend/_app/lib/html.php) geçmeli: temizlenmesi
+      # gereken alan varsa derleme DÜŞER (güvenlik denetimi enjeksiyon-03). Derlemeden ÖNCE ve bağımlılık kurulmadan.
+      - name: İçerik HTML denetimi
+        working-directory: src
+        run: bash ops/icerik-temizlik.sh content/current.json
+
+      # npm ci --ignore-scripts: bağımlılıkların kurulum betikleri ÇALIŞMAZ. Doğrulandı (2026-10-01, package-lock.json):
+      # kurulum betiği olan tek paket unrs-resolver (eslint, yalnızca lint); sharp 0.35 hazır ikilileri (@img/*) isteğe
+      # bağlı bağımlılık olarak gelir, betik gerektirmez; next/swc de öyle. Derleme (next build) ise bağımlılık kodunu
+      # ÇALIŞTIRIR — bu yüzden bu işte sır yoktur ve imza/gönderim ayrı işlerdedir.
+      - name: Derle ve paketle
+        working-directory: src
+        env:
+          NEXT_PUBLIC_SITE_URL: ${{ env.SITE_URL }}
+          NEXT_TELEMETRY_DISABLED: '1'
+          JT_RELEASE: '1'
+          SOURCE_SHA: ${{ needs.denetle.outputs.source }}
+        run: |
+          set -euo pipefail
+          npm ci --ignore-scripts --no-audit --no-fund
+          npm run build
+          node scripts/size-check.mjs out || true
+          node scripts/package.mjs
+
+      # .htaccess dosyaları gizli dosyadır: include-hidden-files olmadan artifact'a girmezdi
+      - name: Paket
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: dist
+          path: |
+            src/dist/public
+            src/dist/_ops
+            src/dist/README.md
+          include-hidden-files: true
+          if-no-files-found: error
+          retention-days: 1
+
+  # Temiz makine; npm ve bağımlılık YOK. Çalışan tek kod: kaynak.tar'daki scripts/sign-release.mjs (node:crypto) — karması
+  # aşağıda SABİT (betik değişince geliştirici bu değeri de günceller; bash ops/test/guvenlik-test.sh denetler).
+  imzala:
+    needs: [denetle, derle]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions: {}
+    env:
+      IMZA_BETIGI_SHA256: 92bca58dc62ed7bdcdc2f30bffa2cab8ddb828eef4873f4d51fcdd07b398f29f
+    steps:
+      - name: Kaynak (yalnız imza betiği, site ayarı ve geliştirici kod imzası)
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: kaynak
+          path: ${{ runner.temp }}/kaynak
+
+      - name: Paket
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      - name: Node.js
+        uses: actions/setup-node@820762786026740c76f36085b0efc47a31fe5020 # v7.0.0
+        with:
+          node-version: 24
+
+      - name: Hazırla
+        run: |
+          set -euo pipefail
+          mkdir -p src
+          tar -xf "$RUNNER_TEMP/kaynak/kaynak.tar" -C src scripts/sign-release.mjs site.config.json ops/code-manifest.json ops/code-manifest.sig
+          echo "$IMZA_BETIGI_SHA256  src/scripts/sign-release.mjs" | sha256sum -c --quiet || { echo "::error::sign-release.mjs karması sabitlenen değerle uyuşmuyor"; exit 1; }
+          # pakette bağ ya da .git olamaz; kod imzası derleme işinden DEĞİL kaynak.tar'dan alınır
+          [ -z "$(find dist -type l -o -name .git | head -1)" ] || { echo "::error::pakette sembolik bağ ya da .git var"; exit 1; }
+          cp src/ops/code-manifest.json src/ops/code-manifest.sig dist/_ops/
+          rm -f dist/_ops/manifest.json dist/_ops/manifest.sig
+
+      - name: İmzala (CI anahtarı)
+        env:
+          SOURCE_SHA: ${{ needs.denetle.outputs.source }}
+          JT_CI_SIGNING_KEY: ${{ secrets.JT_CI_SIGNING_KEY }}
+        run: node src/scripts/sign-release.mjs static --dist dist
+
+      - name: İmza
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: imza
+          path: |
+            dist/_ops/manifest.json
+            dist/_ops/manifest.sig
+            dist/_ops/code-manifest.json
+            dist/_ops/code-manifest.sig
+          if-no-files-found: error
+          retention-days: 1
+
+  # Temiz makine; yazma jetonu YALNIZCA bu işte. Bağımlılık/derleme kodu çalışmaz.
+  yayinla:
+    needs: [denetle, imzala]
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    permissions:
+      contents: write
+    outputs:
+      sha: ${{ steps.push.outputs.sha }}
+    steps:
+      - name: Yayın deposu
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          path: yayin
+          fetch-depth: 1
+          persist-credentials: false
+
+      - name: Paket
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: dist
+          path: dist
+
+      - name: İmza
+        uses: actions/download-artifact@3e5f45b2cfb9172054b4087a40e8e0b5a5461e7c # v8.0.1
+        with:
+          name: imza
+          path: dist/_ops
+
+      - name: Yayına gönder
+        id: push
+        env:
+          SRC: ${{ needs.denetle.outputs.source }}
+          RESET: ${{ inputs.reset_history || 'false' }}
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          [ -z "$(find dist -type l -o -name .git | head -1)" ] || { echo "::error::pakette sembolik bağ ya da .git var"; exit 1; }
+          [ -s dist/_ops/manifest.sig ] || { echo "::error::imza yok"; exit 1; }
+          cd yayin
+          rm -rf public _ops README.md
+          cp -a ../dist/public ../dist/_ops ../dist/README.md .
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          msg="Yayın $(cat _ops/release-id) · kaynak ${SRC:0:7} · içerik v$(jq -r .contentVersion public/version.json)"
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${GITHUB_REPOSITORY}.git"
+          if [ "$RESET" = "true" ]; then
+            git checkout -q --orphan yeni
+            git add -A
+            git commit -q -m "$msg (geçmiş sıfırlandı)"
+            git push -q -f origin HEAD:main
+          else
+            git add -A
+            if git diff --cached --quiet; then echo "Değişiklik yok"; exit 0; fi
+            git commit -q -m "$msg"
+            git push -q origin HEAD:main
+          fi
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "Gönderildi: $(git rev-parse HEAD)"
+
+  # Sunucu yeni sürümü hemen kursun: tetik (saf PHP) indirir → imzaları doğrular → kurar → test eder.
+  # Tetiğe ulaşılamazsa sunucunun cron'u (15 dakikada bir) kurar; bu iş iş akışını hiçbir zaman başarısız saymaz.
+  # ?durum=1 yanıtında yalnızca state/sha/time vardır (ayrıntı sunucudaki deploy.log'da — G12).
+  tetik:
+    needs: yayinla
+    if: needs.yayinla.outputs.sha != ''
+    runs-on: ubuntu-latest
+    timeout-minutes: 6
+    continue-on-error: true
+    permissions: {}
+    steps:
+      - name: Anlık kurulum (tetik)
+        env:
+          SHA: ${{ needs.yayinla.outputs.sha }}
+          TETIK: ${{ secrets.TETIK_URL }}
+        run: |
+          set -u
+          [ -n "$TETIK" ] || { echo "TETIK_URL tanımlı değil; cron kuracak"; exit 0; }
+          TETIK=${TETIK%/}
+          durum() { curl -fsS --connect-timeout 10 -m 15 "$TETIK/?durum=1" 2>/dev/null || true; }
+          tetikle() { n=$((n + 1)); son=$SECONDS; echo "tetik $n: $(curl -sS --connect-timeout 10 -m 20 "$TETIK/" 2>&1 | head -c 200)"; }
+          n=0; son=0; ulasilamadi=0
+          tetikle
+          while [ "$SECONDS" -lt 300 ]; do
+            sleep 5
+            st=$(durum)
+            if [ -z "$st" ]; then
+              ulasilamadi=$((ulasilamadi + 1))
+              if [ "$ulasilamadi" -ge 6 ]; then echo "::warning::Tetiğe ulaşılamıyor; sunucu 15 dakika içinde cron ile kuracak"; exit 0; fi
+              continue
+            fi
+            ulasilamadi=0
+            if [ "$(jq -r '.canli_sha // empty' <<< "$st" 2>/dev/null)" = "$SHA" ]; then
+              echo "Canlıda (${SECONDS} sn): $SHA · $(jq -c .durum <<< "$st")"; exit 0
+            fi
+            state=$(jq -r 'if .durum.sha == env.SHA then .durum.state else empty end' <<< "$st" 2>/dev/null || true)
+            case "$state" in invalid|rolled-back|gated|stage-failed|not-ready|no-verifier|backup-failed)
+              echo "::warning::Sunucu bu sürümü kurmadı ($state) — ayrıntı sunucudaki ~/jaltest-ops/deploy.log"; exit 0 ;;
+            esac
+            # çalışan tetik yoksa yeniden tetikle — en fazla 6 kez, en az 25 sn arayla
+            if [ "$(jq -r '.calisiyor // false' <<< "$st" 2>/dev/null)" != "true" ] && [ $((SECONDS - son)) -ge 25 ] && [ "$n" -lt 6 ]; then
+              tetikle
+            fi
+          done
+          echo "::warning::Tetik 5 dakikada doğrulanamadı; sunucu 15 dakika içinde cron ile kuracak"
